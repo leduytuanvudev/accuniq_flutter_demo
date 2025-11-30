@@ -65,6 +65,12 @@ class AccuniqProvider with ChangeNotifier {
   bool _isReconnecting = false;
   Timer? _reconnectTimer;
 
+  // Auto-connect retry variables
+  Timer? _autoConnectRetryTimer;
+  int _autoConnectRetryCount = 0;
+  static const int _maxAutoConnectRetries = 5;
+  static const Duration _autoConnectRetryInterval = Duration(seconds: 12);
+
   void _setupListeners() {
     _service.deviceInfoStream.listen((info) {
       notifyListeners();
@@ -89,10 +95,18 @@ class AccuniqProvider with ChangeNotifier {
 
     // Listen to connection state changes for auto-reconnect
     _service.connectionStateStream.listen((isConnected) {
-      if (!isConnected &&
+      if (isConnected) {
+        _logs.add('[Connection] ✅ Connected to device');
+        _autoConnectRetryCount =
+            0; // Reset retry count on successful connection
+        _autoConnectRetryTimer?.cancel();
+      } else if (!isConnected &&
           _autoConnectEnabled &&
           !_service.wasManualDisconnect) {
         // Connection lost (not manual disconnect) - attempt auto-reconnect
+        _logs.add(
+          '[Connection] 🔴 Connection lost, scheduling auto-reconnect...',
+        );
         _scheduleAutoReconnect();
       }
       notifyListeners();
@@ -133,8 +147,8 @@ class AccuniqProvider with ChangeNotifier {
     }
 
     if (isAndroid) {
-      // Start scan in background
-      refreshBluetoothDevices();
+      // Load devices first before attempting auto-connect
+      await refreshBluetoothDevices();
 
       // Attempt auto-connect if enabled
       if (_autoConnectEnabled) {
@@ -200,68 +214,123 @@ class AccuniqProvider with ChangeNotifier {
       await _initializeStorage();
     }
 
-    if (!_autoConnectEnabled || isConnected) return;
+    if (!_autoConnectEnabled || isConnected) {
+      _autoConnectRetryCount = 0; // Reset retry count if already connected
+      return;
+    }
 
     _isAutoConnecting = true;
     notifyListeners();
+
+    _logs.add('[Auto-Connect] Starting auto-connect attempt...');
 
     try {
       // Priority 1: Try to connect to last connected device
       final lastDevice = _storageService!.getLastConnectedDevice();
       if (lastDevice != null) {
+        _logs.add(
+          '[Auto-Connect] Looking for last device: ${lastDevice['deviceName']} (${lastDevice['deviceId']})',
+        );
         final device = await _findDeviceById(
           lastDevice['deviceId']!,
           lastDevice['deviceType']!,
         );
         if (device != null) {
           _logs.add(
-            '[Auto-Connect] Attempting to connect to last device: ${lastDevice['deviceName']}',
+            '[Auto-Connect] Found last device, attempting connection...',
           );
           final success = await connect(device);
           if (success) {
             _logs.add(
-              '[Auto-Connect] Successfully connected to ${lastDevice['deviceName']}',
+              '[Auto-Connect] ✅ Successfully connected to ${lastDevice['deviceName']}',
             );
             _storageService!.resetAutoConnectFailCount();
+            _autoConnectRetryCount = 0; // Reset retry count on success
+            _autoConnectRetryTimer?.cancel();
             _isAutoConnecting = false;
             notifyListeners();
             return;
           } else {
+            _logs.add(
+              '[Auto-Connect] ❌ Failed to connect to ${lastDevice['deviceName']}',
+            );
             final failCount = await _storageService!
                 .incrementAutoConnectFailCount();
 
             // Clear last device if failed 3 times
             if (failCount >= 3) {
+              _logs.add(
+                '[Auto-Connect] Clearing last device after 3 failed attempts',
+              );
               await _storageService!.clearLastConnectedDevice();
             }
           }
+        } else {
+          _logs.add('[Auto-Connect] Last device not found in paired devices');
         }
       }
 
       // Priority 2: Try first HC-05 device (Android only)
       if (isAndroid) {
+        _logs.add('[Auto-Connect] Searching for HC-05-USB devices...');
         final hc05Devices = await _service.findHC05Devices();
         if (hc05Devices.isNotEmpty) {
           _logs.add(
-            '[Auto-Connect] Found HC-05-USB device, attempting connection...',
+            '[Auto-Connect] Found ${hc05Devices.length} HC-05-USB device(s), attempting connection...',
           );
           final success = await connect(hc05Devices.first);
           if (success) {
-            _logs.add('[Auto-Connect] Successfully connected to HC-05-USB');
+            _logs.add('[Auto-Connect] ✅ Successfully connected to HC-05-USB');
+            _autoConnectRetryCount = 0; // Reset retry count on success
+            _autoConnectRetryTimer?.cancel();
             _isAutoConnecting = false;
             notifyListeners();
             return;
+          } else {
+            _logs.add('[Auto-Connect] ❌ Failed to connect to HC-05-USB');
           }
+        } else {
+          _logs.add(
+            '[Auto-Connect] No HC-05-USB devices found in paired devices',
+          );
         }
       }
 
-      _logs.add('[Auto-Connect] No suitable device found for auto-connect');
+      // Auto-connect failed - schedule retry if not exceeded max retries
+      _logs.add('[Auto-Connect] No suitable device found or connection failed');
+      if (_autoConnectRetryCount < _maxAutoConnectRetries) {
+        _scheduleAutoConnectRetry();
+      } else {
+        _logs.add(
+          '[Auto-Connect] Max retries ($_maxAutoConnectRetries) reached. Stopping auto-connect.',
+        );
+        _autoConnectRetryCount = 0; // Reset for next time
+      }
     } catch (e) {
-      _logs.add('[Auto-Connect] Error: $e');
+      _logs.add('[Auto-Connect] ❌ Error: $e');
+      if (_autoConnectRetryCount < _maxAutoConnectRetries) {
+        _scheduleAutoConnectRetry();
+      }
     } finally {
       _isAutoConnecting = false;
       notifyListeners();
     }
+  }
+
+  /// Schedule auto-connect retry after delay
+  void _scheduleAutoConnectRetry() {
+    _autoConnectRetryTimer?.cancel();
+    _autoConnectRetryCount++;
+
+    _logs.add(
+      '[Auto-Connect] Scheduling retry $_autoConnectRetryCount/$_maxAutoConnectRetries in ${_autoConnectRetryInterval.inSeconds} seconds...',
+    );
+
+    _autoConnectRetryTimer = Timer(_autoConnectRetryInterval, () {
+      if (!isConnected && _autoConnectEnabled) {
+        _attemptAutoConnect();
+      }
+    });
   }
 
   /// Find device by ID in available devices list
@@ -301,13 +370,16 @@ class AccuniqProvider with ChangeNotifier {
 
   /// Disconnect from device
   void disconnect() {
-    // Cancel any pending reconnect
+    // Cancel any pending reconnect and retry
     _reconnectTimer?.cancel();
+    _autoConnectRetryTimer?.cancel();
     _isReconnecting = false;
+    _autoConnectRetryCount = 0;
     // Mark as manual disconnect
     _service.disconnect(isManual: true);
     _selectedDevice = null;
     _lastMeasurement = null;
+    _logs.add('[Disconnect] Manually disconnected from device');
     notifyListeners();
   }
 
@@ -335,6 +407,7 @@ class AccuniqProvider with ChangeNotifier {
   @override
   void dispose() {
     _reconnectTimer?.cancel();
+    _autoConnectRetryTimer?.cancel();
     _service.dispose();
     super.dispose();
   }

@@ -116,6 +116,16 @@ class AccuniqService {
       // Listen to Bluetooth errors (only log to UI)
       _btErrorSubscription = _bluetoothService!.errorStream.listen((error) {
         _log('BT: $error');
+
+        // Detect connection closed/error and emit connection state for auto-reconnect
+        if (error.contains('Connection closed') ||
+            error.contains('Connection error') ||
+            error.contains('Disconnected')) {
+          // Connection was lost, not manual disconnect
+          if (_isConnected) {
+            disconnect(isManual: false);
+          }
+        }
       });
 
       final success = await _bluetoothService!.connect(device);
@@ -249,8 +259,13 @@ class AccuniqService {
 
   void _onDataReceived(Uint8List data) {
     // Log ALL received data - important for debugging
+    _log('📥 [DATA] Received ${data.length} bytes');
     print('📥 [DATA] Received ${data.length} bytes');
-    print('📥 [DATA] HEX: ${_bytesToHex(data)}');
+
+    // Log HEX format
+    final hexString = _bytesToHex(data);
+    _log('📥 [DATA] HEX: $hexString');
+    print('📥 [DATA] HEX: $hexString');
 
     // Try to log as ASCII if printable
     try {
@@ -258,6 +273,7 @@ class AccuniqService {
       if (asciiString.codeUnits.every(
         (c) => c >= 32 && c <= 126 || c == 9 || c == 10 || c == 13,
       )) {
+        _log('📥 [DATA] ASCII: $asciiString');
         print('📥 [DATA] ASCII: $asciiString');
       }
     } catch (e) {
@@ -267,10 +283,13 @@ class AccuniqService {
     for (var byte in data) {
       final packet = _parser.parseByte(byte);
       if (packet != null) {
-        print('📦 [DATA] Parsed packet: ${_bytesToHex(packet)}');
+        final packetHex = _bytesToHex(packet);
+        _log('📦 [DATA] Parsed packet: $packetHex');
+        print('📦 [DATA] Parsed packet: $packetHex');
 
         // Check if this is an echo of the last sent packet
         if (_lastSentPacket != null && _isEcho(packet, _lastSentPacket!)) {
+          _log('⚠️  [DATA] Ignoring echo packet');
           print('⚠️  [DATA] Ignoring echo packet');
           continue; // Skip echo packets
         }
@@ -296,35 +315,41 @@ class AccuniqService {
 
     switch (command) {
       case 'I': // Device Version
-        // Silently handle version response
+        _log('📥 [CMD-I] Device Version received');
         if (data != null) {
           try {
             _deviceInfo = DeviceInfo.fromString(data);
             _deviceInfoController.add(_deviceInfo!);
             _log('✅ Device connected: ${_deviceInfo!.deviceName}');
+            _log('📥 [CMD-I] Data: $data');
           } catch (e) {
-            // Silent error handling
+            _log('❌ [CMD-I] Error parsing device info: $e');
           }
         }
         break;
 
       case 'K': // Serial Number
-        // Silently handle serial number response
+        _log('📥 [CMD-K] Serial Number received');
         if (data != null && _deviceInfo != null) {
           _deviceInfo = _deviceInfo!.copyWith(serialNumber: data);
           _deviceInfoController.add(_deviceInfo!);
+          _log('📥 [CMD-K] Serial Number: $data');
         }
         break;
 
       case 'A': // Device State
-        // Silently handle state response
+        _log('📥 [CMD-A] Device State received');
         if (packet.length >= 3) {
           final stateByte = packet[2];
           final newState = DeviceStateExtension.fromByte(stateByte);
+          _log(
+            '📥 [CMD-A] State byte: 0x${stateByte.toRadixString(16).toUpperCase()}, State: ${newState.displayName}',
+          );
 
           if (newState != _currentState) {
             _currentState = newState;
             _stateController.add(_currentState);
+            _log('📥 [CMD-A] State changed to: ${newState.displayName}');
 
             // Auto request measurement when complete
             if (_currentState == DeviceState.completeDisplay) {
@@ -406,13 +431,20 @@ class AccuniqService {
         break;
 
       case 'B': // Member Info ACK/NAK
-        // Silently handle member info response
+        _log('📥 [CMD-B] Member Info ACK/NAK received');
+        if (data != null) {
+          _log('📥 [CMD-B] Data: $data');
+        }
         break;
 
       default:
-        // Log unknown commands but don't spam
+        // Log unknown commands
         if (data != null && data.isNotEmpty) {
+          _log('⚠️  [DATA] Unknown command "$command" with data: $data');
           print('⚠️  [DATA] Unknown command "$command" with data: $data');
+        } else {
+          _log('⚠️  [DATA] Unknown command "$command" (no data)');
+          print('⚠️  [DATA] Unknown command "$command" (no data)');
         }
     }
   }
